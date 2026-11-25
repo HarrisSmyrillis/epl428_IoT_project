@@ -41,8 +41,10 @@ CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 S = 20               # model input is S x S (must match S in ocr.py)
 HIDDEN = 256         # neurons in 1st hidden layer (64 = smaller/faster, 256 = more accurate/slower)
 HIDDEN2 = 256        # neurons in 2nd hidden layer (0 = only one hidden layer)
-EPOCHS = 25
+EPOCHS = 50
 OUT_FILE = "ocr.bin"
+SEED = None          # None = different random train/test split every run;
+                     # a number (e.g. the seed printed by an earlier run) repeats that run exactly
 
 # Training data. Comment out a line to leave that source out.
 #   max/char: use at most this many images per character (None = all)
@@ -63,29 +65,19 @@ ALL_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 # PREPROCESSING - must be IDENTICAL to ocr.py on the ESP32
 # ----------------------------------------------------------------------------
 def otsu(gray):
-    """Pick the best black/white threshold automatically (same code as ocr.py)."""
-    hist = np.bincount(gray.ravel(), minlength=256).tolist()
-    total = gray.size
-    sum_all = sum(i * h for i, h in enumerate(hist))
-    wb = 0
-    sb = 0
-    best = -1.0
-    thr = 0
-    for t in range(256):
-        wb += hist[t]
-        if wb == 0:
-            continue
-        wf = total - wb
-        if wf == 0:
-            break
-        sb += t * hist[t]
-        mb = sb / wb
-        mf = (sum_all - sb) / wf
-        v = wb * wf * (mb - mf) ** 2
-        if v > best:
-            best = v
-            thr = t
-    return thr
+    """Pick the best black/white threshold automatically (same result as otsu in ocr.py).
+
+    For every threshold t: split pixels into dark (<= t) and bright (> t) and
+    score how far apart the two groups' average brightness is. Best score wins.
+    """
+    hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+    wb = np.cumsum(hist)                         # number of dark pixels
+    sb = np.cumsum(np.arange(256) * hist)        # sum of dark pixel values
+    wf = gray.size - wb                          # number of bright pixels
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v = wb * wf * (sb / wb - (sb[-1] - sb) / wf) ** 2
+    v[(wb == 0) | (wf == 0)] = -1                # thresholds with an empty group don't count
+    return int(np.argmax(v))
 
 
 def text_mask(gray):
@@ -245,8 +237,10 @@ def main():
     bad = [c for c in CHARS if c not in ALL_CHARS]
     if bad:
         sys.exit(f"CHARS contains characters not in Chars74K: {bad}")
-    random.seed(0)
-    np.random.seed(0)
+    seed = SEED if SEED is not None else random.SystemRandom().randrange(2**31)
+    print(f"Random seed: {seed}   (set SEED = {seed} to repeat this run)")
+    random.seed(seed)
+    np.random.seed(seed)
 
     print("Loading data...")
     X, y, tests = [], [], {}           # tests: source name -> (X_test, y_test)
@@ -264,6 +258,7 @@ def main():
     save_preview(X, y)
 
     import tensorflow as tf
+    tf.keras.utils.set_random_seed(seed)    # starting weights, dropout, batch order
     layers = [
         tf.keras.layers.Input((S * S,)),
         tf.keras.layers.Dense(HIDDEN, activation="relu"),
