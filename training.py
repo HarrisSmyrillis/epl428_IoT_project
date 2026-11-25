@@ -38,7 +38,8 @@ from PIL import Image, ImageFilter
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 S = 20               # model input is S x S (must match S in ocr.py)
-HIDDEN = 128         # hidden neurons (64 = smaller/faster, 256 = more accurate/slower)
+HIDDEN = 256         # neurons in 1st hidden layer (64 = smaller/faster, 256 = more accurate/slower)
+HIDDEN2 = 256        # neurons in 2nd hidden layer (0 = only one hidden layer)
 EPOCHS = 25
 OUT_FILE = "ocr.bin"
 
@@ -294,12 +295,18 @@ def main():
     save_preview(X, y)
 
     import tensorflow as tf
-    model = tf.keras.Sequential([
+    layers = [
         tf.keras.layers.Input((S * S,)),
         tf.keras.layers.Dense(HIDDEN, activation="relu"),
         tf.keras.layers.Dropout(0.3),        # training only; not exported
-        tf.keras.layers.Dense(len(CHARS), activation="softmax"),
-    ])
+    ]
+    if HIDDEN2:
+        layers += [
+            tf.keras.layers.Dense(HIDDEN2, activation="relu"),
+            tf.keras.layers.Dropout(0.3),
+        ]
+    layers.append(tf.keras.layers.Dense(len(CHARS), activation="softmax"))
+    model = tf.keras.Sequential(layers)
     model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     model.fit(X, y, epochs=EPOCHS, batch_size=128, validation_split=0.1,
               callbacks=[tf.keras.callbacks.EarlyStopping(patience=4, restore_best_weights=True)])
