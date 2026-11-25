@@ -4,6 +4,8 @@
 # the ESP32 can't decode it; save JPEGs as PNG on the PC first).
 # Images are turned into grayscale and shrunk on the board, then read by
 # the model trained with training.py (ocr.bin).
+# The result is printed and also shown on the board's SSD1306 OLED
+# (found automatically on LilyGO/TTGO LoRa32 boards; see OLED_PINS).
 #
 # Run it (from the PC, with the board connected):
 #     mpremote cp ocr.py ocr.bin :          # once
@@ -186,9 +188,11 @@ def read_text(layers, gray, w, h, min_conf=0.0):
 
 
 def predict_file(layers, path, min_conf=0.5):
-    """Load an image file, read it and print the result. Returns the text.
-    Characters the model is less sure about than min_conf are shown as '?'."""
+    """Load an image file, read it, print the result and show it on the OLED.
+    Returns the text. Characters the model is less sure about than min_conf
+    are shown as '?'."""
     gc.collect()
+    show(path, "", "reading...")
     try:
         t0 = _ms()
         gray, w, h = load_image(path)
@@ -196,19 +200,230 @@ def predict_file(layers, path, min_conf=0.5):
         ms = _ms_since(t0)
     except MemoryError:
         print(path + ": out of memory - use a smaller image (or lower MAX_SIDE)")
+        show(path, "out of memory - use a smaller image", big=False)
         return ""
     except (OSError, ValueError) as e:
         print(path + ": " + str(e))
+        show(path, "error: " + str(e), big=False)
         return ""
     line = "{}: '{}'".format(path, text)
+    info = "{:.1f} s".format(ms / 1000)
     if len(text) == 1:                          # single character: show how sure it is
-        line += "  ({:.0f}% sure)".format(read_char(layers, gray, w, h)[1] * 100)
+        conf = read_char(layers, gray, w, h)[1] * 100
+        line += "  ({:.0f}% sure)".format(conf)
+        info = "{:.0f}% sure {}".format(conf, info)
     print(line + "  [{}x{}, {} ms]".format(w, h, ms))
+    show(path, text if text else "(nothing found)", info, big=bool(text))
     return text
+
+
+# ---------------------------------------------------------------- OLED display
+# 128x64 OLED (SSD1306 or SH1106) over I2C. Found automatically, or set it:
+#   OLED_PINS = (17, 18, None, 2)  # (SDA, SCL, reset pin or None, column offset)
+# Column offset: 2 for SH1106 (1.3" displays), 0 for SSD1306 (0.96" displays).
+OLED_PINS = None
+_OLED_CANDIDATES_S3 = (                 # ESP32-S3 boards
+    (17, 18, None, 2),  # LilyGO T-Beam Supreme (SH1106 1.3")
+)
+_OLED_CANDIDATES_ESP32 = (              # classic ESP32 boards
+    (21, 22, None, 0),  # LilyGO/TTGO LoRa32 V1.3 / V1.6 / V2.x, T-Beam V1.x
+    (4, 15, 16, 0),     # LilyGO/TTGO LoRa32 V1.0 (also Heltec V1/V2)
+)
+_oled = None
+_display_tried = False
+
+
+class _OLED:
+    """Minimal driver for SSD1306 and SH1106 128x64 OLEDs. Writes the screen
+    page by page (8 rows at a time), which both chips understand."""
+
+    def __init__(self, i2c, addr, col_offset=0, width=128, height=64):
+        import framebuf
+        self.i2c, self.addr, self.col = i2c, addr, col_offset
+        self.width, self.height, self.pages = width, height, height // 8
+        self.buf = bytearray(self.pages * width)
+        self.fb = framebuf.FrameBuffer(self.buf, width, height, framebuf.MONO_VLSB)
+        # One page of the chip's whole memory row: SH1106 has 132 columns
+        # (2 hidden ones each side), SSD1306 has 128. Writing the full row
+        # every time keeps the edge columns blank instead of random noise.
+        self.line = bytearray(1 + width + 2 * col_offset)
+        self.line[0] = 0x40                             # "display data follows"
+        if col_offset:
+            # SH1106 (1.3"): keep its own power-on settings, only flip the
+            # picture the right way round and set the brightness. (Tested on
+            # the T-Beam Supreme: the SSD1306 setup below confuses this chip.)
+            setup = (0xAE, 0xA1, 0xC8, 0x81, 0xCF)
+        else:
+            # SSD1306 (0.96"): full setup, page-by-page addressing
+            setup = (0xAE, 0x20, 0x02, 0x40, 0xA1, 0xA8, height - 1, 0xC8, 0xD3, 0x00,
+                     0xDA, 0x12, 0xD5, 0x80, 0xD9, 0xF1, 0xDB, 0x30, 0x81, 0xFF,
+                     0xA4, 0xA6, 0x8D, 0x14)
+        for c in setup:
+            self._cmd(c)
+        self.show()                                     # clear power-up noise...
+        self._cmd(0xAF)                                 # ...then switch the display on
+
+    def _cmd(self, c):
+        self.i2c.writeto(self.addr, bytes((0x80, c)))
+
+    def show(self):
+        w, c0 = self.width, 1 + self.col
+        for p in range(self.pages):
+            self._cmd(0xB0 | p)                         # page (8-row band)
+            self._cmd(0x00)                             # start at memory column 0
+            self._cmd(0x10)
+            self.line[c0:c0 + w] = self.buf[p * w:(p + 1) * w]
+            self.i2c.writeto(self.addr, self.line)
+
+
+def _is_esp32s3():
+    try:
+        return "S3" in os.uname().machine.upper()
+    except AttributeError:
+        return False
+
+
+def _tbeam_supreme_power(I2C, Pin):
+    """T-Beam Supreme: the AXP2101 power chip (I2C SDA=42, SCL=41) switches the
+    OLED/sensor power rail ALDO1. Turn it on at 3.3 V, as LilyGO's own code does."""
+    try:
+        pmu = I2C(1, sda=Pin(42), scl=Pin(41), freq=400000)
+        if 0x34 not in pmu.scan():
+            return False
+        pmu.writeto_mem(0x34, 0x92, bytes([(3300 - 500) // 100]))   # ALDO1 = 3.3 V
+        on = pmu.readfrom_mem(0x34, 0x90, 1)[0]
+        pmu.writeto_mem(0x34, 0x90, bytes([on | 0x01]))            # ALDO1 on
+        time.sleep_ms(100)
+        print("Switched on the OLED power rail (AXP2101 ALDO1)")
+        return True
+    except Exception:
+        return False
+
+
+def _try_oled(I2C, Pin, sda, scl, rst, col):
+    if rst is not None:                         # some boards hold the OLED in reset
+        r = Pin(rst, Pin.OUT)
+        r.value(0)
+        time.sleep_ms(20)
+        r.value(1)
+    i2c = I2C(0, sda=Pin(sda), scl=Pin(scl), freq=400000)
+    found = [a for a in (0x3C, 0x3D) if a in i2c.scan()]
+    if not found:
+        return False
+    global _oled
+    _oled = _OLED(i2c, found[0], col)
+    print("OLED found on SDA={}, SCL={}".format(sda, scl))
+    return True
+
+
+def init_display():
+    """Find the OLED and switch it on. Returns True if one was found."""
+    global _display_tried
+    _display_tried = True
+    try:
+        from machine import I2C, Pin
+    except ImportError:
+        return False                            # not on a board (PC testing)
+    s3 = _is_esp32s3()
+    # Only try pins that are safe on this chip: on a classic ESP32 with PSRAM,
+    # GPIO 16/17 belong to the PSRAM and must not be touched.
+    if OLED_PINS:
+        candidates = (OLED_PINS,)
+    else:
+        candidates = _OLED_CANDIDATES_S3 if s3 else _OLED_CANDIDATES_ESP32
+    has_psram = hasattr(gc, "mem_free") and gc.mem_free() > 400000
+    for attempt in range(2):
+        for sda, scl, rst, col in candidates:
+            if rst is not None and has_psram and not s3 and not OLED_PINS:
+                continue
+            try:
+                if _try_oled(I2C, Pin, sda, scl, rst, col):
+                    return True
+            except Exception:
+                pass
+        # Not found: on an ESP32-S3 T-Beam Supreme the display may be unpowered
+        if attempt == 0 and not (s3 and _tbeam_supreme_power(I2C, Pin)):
+            break
+    print("No OLED found - results only in the Shell (set OLED_PINS in ocr.py)")
+    return False
+
+
+def _big_text(fb, s, x, y, k):
+    """Draw text k times bigger than the built-in 8x8 font."""
+    import framebuf
+    tmp = framebuf.FrameBuffer(bytearray(len(s) * 8), len(s) * 8, 8, framebuf.MONO_VLSB)
+    tmp.text(s, 0, 0, 1)
+    for py in range(8):
+        for px in range(len(s) * 8):
+            if tmp.pixel(px, py):
+                fb.fill_rect(x + px * k, y + py * k, k, k, 1)
+
+
+def _wrap(text, cols, max_lines=4):
+    """Split text into lines of at most cols characters, at spaces if possible."""
+    lines, cur = [], ""
+    for word in text.split():
+        while len(word) > cols:                 # word longer than a line: cut it
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:cols])
+            word = word[cols:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= cols:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines[:max_lines]
+
+
+def _centered(fb, s, y):
+    fb.text(s, max(0, (_oled.width - len(s) * 8) // 2), y, 1)
+
+
+def clear_display():
+    """Make the whole screen blank."""
+    if _oled is not None:
+        _oled.fb.fill(0)
+        _oled.show()
+
+
+def show(title, text="", info="", big=True):
+    """OLED layout, every line centred: title on top, the text in the middle
+    (big if it fits), info line at the bottom. Does nothing without a display."""
+    if _oled is None and not _display_tried:
+        init_display()                          # first use without main()
+    if _oled is None:
+        return
+    # Layout keeps to rows 0-59: on the T-Beam Supreme's 1.3" OLED the last
+    # few rows (60-63) are hidden behind the edge of the panel.
+    fb, w, cols = _oled.fb, _oled.width, _oled.width // 8      # 16 characters per line
+    fb.fill(0)
+    if title:                                   # rows 0-7, line under it at row 10
+        _centered(fb, title[:cols], 0)
+        fb.hline(0, 10, w, 1)
+    if text:                                    # middle area: rows 12-50
+        k = 3 if len(text) <= 5 else (2 if len(text) <= 8 else 1)
+        if big and k > 1:
+            _big_text(fb, text, (w - len(text) * 8 * k) // 2, 12 + (38 - 8 * k) // 2, k)
+        else:                                   # small text, up to 4 lines
+            lines = _wrap(text, cols)
+            y0 = 12 + (38 - (len(lines) * 9 - 1)) // 2
+            for n, line in enumerate(lines):
+                _centered(fb, line, y0 + n * 9)
+    if info:                                    # rows 52-59 (visible on the T-Beam)
+        _centered(fb, info[:cols], 52)
+    _oled.show()
 
 
 def main():
     """Ask for image files on the board and read them, until Enter is pressed."""
+    init_display()                              # first thing (before the model: PSRAM check)
+    clear_display()
     layers = load()
     print("Model loaded:", len(layers), "layers, characters:", CHARS)
     if hasattr(gc, "mem_free"):
@@ -220,6 +435,7 @@ def main():
         if not name:
             break
         predict_file(layers, name)
+    clear_display()
 
 
 # ---------------------------------------------------------------- image files
