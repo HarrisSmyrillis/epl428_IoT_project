@@ -25,6 +25,7 @@ import random
 import struct
 import sys
 import tarfile
+from collections import Counter
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -43,21 +44,19 @@ HIDDEN2 = 256        # neurons in 2nd hidden layer (0 = only one hidden layer)
 EPOCHS = 25
 OUT_FILE = "ocr.bin"
 
-USE_FNT = True       # computer fonts
-USE_HND = True       # handwriting
-USE_IMG = True       # real photos  <- most important for reading camera images
-MAX_FNT_PER_CHAR = 400   # fonts give ~1000 per char; limit so photos aren't drowned out
-IMG_AUGMENT = 8          # make this many extra variations of every real photo
-HND_AUGMENT = 3          # ... and of every handwritten image
+# Training data. Comment out a line to leave that source out.
+#   max/char: use at most this many images per character (None = all)
+#   augment:  extra random variations made of every training image
+#   test:     fraction kept aside (never trained on) to measure accuracy at the end
+# Keep "Img" first: the loading order decides the random test split.
+SOURCES = {  # name:  archive,           folder,                    max/char, augment, test
+    "Img": ("EnglishImg.tgz", "English/Img/GoodImg/Bmp",  None,     8,       0.15),  # real photos <- most important
+    "Fnt": ("EnglishFnt.tgz", "English/Fnt",              400,      0,       0.0),   # fonts (~1000/char; limited so photos aren't drowned out)
+    "Hnd": ("EnglishHnd.tgz", "English/Hnd/Img",          None,     3,       0.15),  # handwriting
+}
 
 # Chars74K folder SampleNNN -> character
 ALL_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-SOURCES = {
-    "Fnt": ("EnglishFnt.tgz", "English/Fnt"),
-    "Hnd": ("EnglishHnd.tgz", "English/Hnd/Img"),
-    "Img": ("EnglishImg.tgz", "English/Img/GoodImg/Bmp"),
-}
 
 
 # ----------------------------------------------------------------------------
@@ -156,48 +155,22 @@ def extract(tgz):
     return True
 
 
-def load_source(name, max_per_char=None, n_aug=0):
-    tgz, folder = SOURCES[name]
-    if not os.path.isdir(folder) and not extract(tgz):
-        return [], []
-    X, y = [], []
-    for idx, ch in enumerate(ALL_CHARS):
-        if ch not in CHARS:
-            continue
-        files = sorted(glob.glob(os.path.join(folder, f"Sample{idx + 1:03d}", "*.png")))
-        if max_per_char:
-            random.shuffle(files)
-            files = files[:max_per_char]
-        label = CHARS.index(ch)
-        for f in files:
-            try:
-                img = Image.open(f)
-                img.load()
-            except Exception:
-                continue
-            x = prepare(img)
-            if x is not None:
-                X.append(x); y.append(label)
-            for _ in range(n_aug):
-                x = prepare(augment(img))
-                if x is not None:
-                    X.append(x); y.append(label)
-    print(f"  {name}: {len(X)} training images")
-    return X, y
+def load_source(name):
+    """Load one Chars74K source (settings from SOURCES) -> (X_train, y_train, X_test, y_test).
 
-
-def split_files_img():
-    """Keep 15% of the real photos aside (not augmented) to measure real-photo accuracy."""
-    tgz, folder = SOURCES["Img"]
-    if not os.path.isdir(folder) and not extract(tgz):
-        return [], [], [], []
+    Test images are never augmented, so nothing about them leaks into training.
+    """
+    tgz, folder, max_per_char, n_aug, test_frac = SOURCES[name]
     Xtr, ytr, Xte, yte = [], [], [], []
-    for idx, ch in enumerate(ALL_CHARS):
-        if ch not in CHARS:
-            continue
-        files = sorted(glob.glob(os.path.join(folder, f"Sample{idx + 1:03d}", "*.png")))
-        random.shuffle(files)
-        n_test = max(1, int(len(files) * 0.15)) if files else 0
+    if not os.path.isdir(folder) and not extract(tgz):
+        return Xtr, ytr, Xte, yte
+    for ch in CHARS:
+        sample = f"Sample{ALL_CHARS.index(ch) + 1:03d}"
+        files = sorted(glob.glob(os.path.join(folder, sample, "*.png")))
+        if max_per_char or test_frac:
+            random.shuffle(files)
+        files = files[:max_per_char]                     # None keeps all
+        n_test = max(1, int(len(files) * test_frac)) if files and test_frac else 0
         label = CHARS.index(ch)
         for k, f in enumerate(files):
             try:
@@ -210,13 +183,13 @@ def split_files_img():
                 continue
             if k < n_test:
                 Xte.append(x); yte.append(label)
-            else:
-                Xtr.append(x); ytr.append(label)
-                for _ in range(IMG_AUGMENT):
-                    xa = prepare(augment(img))
-                    if xa is not None:
-                        Xtr.append(xa); ytr.append(label)
-    print(f"  Img: {len(Xtr)} training images (with variations), {len(Xte)} real photos kept for testing")
+                continue
+            Xtr.append(x); ytr.append(label)
+            for _ in range(n_aug):
+                xa = prepare(augment(img))
+                if xa is not None:
+                    Xtr.append(xa); ytr.append(label)
+    print(f"  {name}: {len(Xtr)} training images (with variations), {len(Xte)} kept for testing")
     return Xtr, ytr, Xte, yte
 
 
@@ -276,16 +249,12 @@ def main():
     np.random.seed(0)
 
     print("Loading data...")
-    X, y, Xte_img, yte_img = [], [], [], []
-    if USE_IMG:
-        a, b, Xte_img, yte_img = split_files_img()
+    X, y, tests = [], [], {}           # tests: source name -> (X_test, y_test)
+    for name in SOURCES:
+        a, b, c, d = load_source(name)
         X += a; y += b
-    if USE_FNT:
-        a, b = load_source("Fnt", max_per_char=MAX_FNT_PER_CHAR)
-        X += a; y += b
-    if USE_HND:
-        a, b = load_source("Hnd", n_aug=HND_AUGMENT)
-        X += a; y += b
+        if c:
+            tests[name] = (np.array(c, np.float32), np.array(d))
     if not X:
         sys.exit("No images loaded. Put the .tgz files in the same folder as this script.")
 
@@ -313,20 +282,17 @@ def main():
 
     export(model, OUT_FILE)
 
-    if len(Xte_img):
-        Xte_img, yte_img = np.array(Xte_img, np.float32), np.array(yte_img)
-        pred = run_bin(OUT_FILE, Xte_img)
-        print(f"\nAccuracy on real photos it has never seen: {(pred == yte_img).mean() * 100:.1f}%")
-        # most common mix-ups
-        pairs = {}
-        for t, pr in zip(yte_img, pred):
-            if t != pr:
-                k = (CHARS[t], CHARS[pr])
-                pairs[k] = pairs.get(k, 0) + 1
-        top = sorted(pairs.items(), key=lambda kv: -kv[1])[:8]
-        if top:
-            print("Most common mistakes (real -> guessed):",
-                  ", ".join(f"{a}->{b} x{n}" for (a, b), n in top))
+    # Test each source separately on images it has never seen, so the
+    # real-photo score (what matters for the camera) isn't mixed with the others.
+    if tests:
+        print("\nAccuracy on test images it has never seen:")
+    for name, (Xte, yte) in tests.items():
+        pred = run_bin(OUT_FILE, Xte)
+        print(f"  {name}: {(pred == yte).mean() * 100:.1f}%  ({len(Xte)} images)")
+        mistakes = Counter((CHARS[t], CHARS[p]) for t, p in zip(yte, pred) if t != p)
+        if mistakes:
+            print("    most common mistakes (real -> guessed):",
+                  ", ".join(f"{a}->{b} x{n}" for (a, b), n in mistakes.most_common(8)))
 
     print(f"\nDone. Copy {OUT_FILE} to the ESP32.")
     print(f"In ocr.py set:  CHARS = {CHARS!r}")
