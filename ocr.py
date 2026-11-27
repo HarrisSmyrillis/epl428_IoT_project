@@ -9,8 +9,10 @@
 #
 # Run it (from the PC, with the board connected):
 #     mpremote cp ocr.py ocr.bin :          # once
-#     mpremote cp photo.png :               # every image you want to read
-#     mpremote run ocr.py                   # asks which image to read
+#     mpremote run ocr.py                   # waits for images over Bluetooth
+#     python send_images.py photo.png       # on the laptop: sends images, prints results
+# Images arrive over Bluetooth Low Energy and are read straight from RAM.
+# Set USE_BLUETOOTH = False to read image files uploaded to the board instead.
 #
 # Or use it from your own code:
 #   import ocr
@@ -191,30 +193,41 @@ def predict_file(layers, path, min_conf=0.5):
     """Load an image file, read it, print the result and show it on the OLED.
     Returns the text. Characters the model is less sure about than min_conf
     are shown as '?'."""
+    return _predict(layers, path, path, min_conf)["text"]
+
+
+def _predict(layers, src, name, min_conf=0.5):
+    """src: file name or file-like object. Prints and displays the result and
+    returns it as a dict (text, conf, ms, w, h, error)."""
     gc.collect()
-    show(path, "", "reading...")
+    show(name, "", "reading...")
+    res = {"name": name, "text": "", "conf": None, "ms": 0, "w": 0, "h": 0, "error": None}
     try:
         t0 = _ms()
-        gray, w, h = load_image(path)
+        gray, w, h = load_image(src)
         text = read_text(layers, gray, w, h, min_conf)
         ms = _ms_since(t0)
     except MemoryError:
-        print(path + ": out of memory - use a smaller image (or lower MAX_SIDE)")
-        show(path, "out of memory - use a smaller image", big=False)
-        return ""
-    except (OSError, ValueError) as e:
-        print(path + ": " + str(e))
-        show(path, "error: " + str(e), big=False)
-        return ""
-    line = "{}: '{}'".format(path, text)
+        res["error"] = "out of memory - use a smaller image"
+        print(name + ": out of memory - use a smaller image (or lower MAX_SIDE)")
+        show(name, res["error"], big=False)
+        return res
+    except (OSError, ValueError, KeyError, IndexError) as e:
+        res["error"] = str(e) or "could not read the image"
+        print(name + ": " + res["error"])
+        show(name, "error: " + res["error"], big=False)
+        return res
+    res.update(text=text, ms=ms, w=w, h=h)
+    line = "{}: '{}'".format(name, text)
     info = "{:.1f} s".format(ms / 1000)
     if len(text) == 1:                          # single character: show how sure it is
         conf = read_char(layers, gray, w, h)[1] * 100
+        res["conf"] = round(conf)
         line += "  ({:.0f}% sure)".format(conf)
         info = "{:.0f}% sure {}".format(conf, info)
     print(line + "  [{}x{}, {} ms]".format(w, h, ms))
-    show(path, text if text else "(nothing found)", info, big=bool(text))
-    return text
+    show(name, text if text else "(nothing found)", info, big=bool(text))
+    return res
 
 
 # ---------------------------------------------------------------- OLED display
@@ -420,14 +433,27 @@ def show(title, text="", info="", big=True):
     _oled.show()
 
 
+USE_BLUETOOTH = True    # True: images come from the laptop over Bluetooth (send_images.py)
+                        # False: images are files uploaded to the board (asks for a name)
+
+
 def main():
-    """Ask for image files on the board and read them, until Enter is pressed."""
+    """Read images sent over Bluetooth (or files on the board) until stopped."""
     init_display()                              # first thing (before the model: PSRAM check)
     clear_display()
     layers = load()
     print("Model loaded:", len(layers), "layers, characters:", CHARS)
     if hasattr(gc, "mem_free"):
         print("Free memory:", gc.mem_free(), "bytes")
+    if USE_BLUETOOTH:
+        bluetooth_loop(layers)
+    else:
+        file_loop(layers)
+    clear_display()
+
+
+def file_loop(layers):
+    """Ask for image files on the board and read them, until Enter is pressed."""
     while True:
         images = [f for f in sorted(os.listdir()) if _ext(f) in IMAGE_EXT]
         print("\nImages on the board:", ", ".join(images) if images else "(none - copy some with mpremote cp)")
@@ -435,7 +461,247 @@ def main():
         if not name:
             break
         predict_file(layers, name)
-    clear_display()
+
+
+# ---------------------------------------------------------------- Bluetooth
+# Bluetooth Low Energy (the ESP32-S3 has no classic Bluetooth), using the
+# Nordic UART Service, so any "BLE UART" app can talk to it too.
+# Protocol (laptop side: send_images.py):
+#   laptop -> board   "IMG <size> <name>\n"            board answers "OK" or "ERROR <why>"
+#   laptop -> board   <size> raw bytes of the image file, in blocks of BT_BLOCK
+#   board  -> laptop  "ACK <bytes so far>" after every block, "DONE <size>" at the end
+#   board  -> laptop  "RESULT {json}" once the image has been read
+# Every board message ends with "\n" and may arrive split over several notifications.
+BT_NAME = "ESP32-OCR"
+BT_BLOCK = 4096             # bytes sent before the laptop waits for an ACK (must match send_images.py)
+_NUS = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+_NUS_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"     # laptop writes here
+_NUS_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"     # board notifies here
+_FLAG_READ, _FLAG_WRITE_NR, _FLAG_WRITE, _FLAG_NOTIFY = 0x02, 0x04, 0x08, 0x10
+_IRQ_CONNECT, _IRQ_DISCONNECT, _IRQ_WRITE, _IRQ_MTU = 1, 2, 3, 21
+
+
+class _MemFile:
+    """Read-only file over bytes in RAM (read + seek), so a received image can
+    be decoded without saving it to flash first."""
+
+    def __init__(self, data):
+        self.mv = memoryview(data)
+        self.p = 0
+
+    def read(self, n=-1):
+        end = len(self.mv) if n is None or n < 0 else min(len(self.mv), self.p + n)
+        b = bytes(self.mv[self.p:end])
+        self.p = end
+        return b
+
+    def seek(self, p, whence=0):
+        self.p = max(0, min(len(self.mv), p + (self.p if whence == 1 else len(self.mv) if whence == 2 else 0)))
+        return self.p
+
+
+class BLEReceiver:
+    """Advertises as BT_NAME and collects images written by the laptop.
+    A finished image is available from take() as (name, bytearray)."""
+
+    def __init__(self, name=BT_NAME):
+        import bluetooth
+        self.name = name
+        self.ble = bluetooth.BLE()
+        self.ble.active(True)
+        try:
+            self.ble.config(mtu=247)            # bigger packets = faster transfer
+        except Exception:
+            pass
+        self.ble.irq(self._irq)
+        svc = (bluetooth.UUID(_NUS), (
+            (bluetooth.UUID(_NUS_TX), _FLAG_READ | _FLAG_NOTIFY),
+            (bluetooth.UUID(_NUS_RX), _FLAG_WRITE | _FLAG_WRITE_NR),
+        ))
+        ((self.tx, self.rx),) = self.ble.gatts_register_services((svc,))
+        # append=True: writes that arrive before we read them are added up, not overwritten
+        self.ble.gatts_set_buffer(self.rx, 2 * BT_BLOCK, True)
+        self.conn = None
+        self.mtu = 23
+        self.job = None
+        self.state = "waiting"                  # waiting / connected / receiving
+        self._busy = False
+        self._reset()
+        self._advertise()
+
+    def _reset(self):
+        self.head = b""                         # incomplete command line
+        self.body = None                        # image being received
+        self.size = self.pos = self.next_ack = 0
+        self.img_name = ""
+
+    def _advertise(self):
+        n = self.name.encode()
+        adv = bytes((2, 0x01, 0x06, len(n) + 1, 0x09)) + n     # flags + complete name
+        self.ble.gap_advertise(100000, adv_data=adv)
+        print("Bluetooth: waiting for a connection as '{}'".format(self.name))
+
+    def _irq(self, event, data):
+        if event == _IRQ_CONNECT:
+            self.conn = data[0]
+            self._reset()
+            self.state = "connected"
+            print("Bluetooth: laptop connected")
+        elif event == _IRQ_DISCONNECT:
+            self.conn = None
+            self._reset()
+            self.state = "waiting"
+            print("Bluetooth: disconnected")
+            self._advertise()
+        elif event == _IRQ_WRITE and data[1] == self.rx:
+            self.poll()
+        elif event == _IRQ_MTU:
+            self.mtu = data[1]
+
+    def poll(self):
+        """Process whatever the laptop has written so far. Called from the
+        Bluetooth event and from the main loop; the flag stops the event from
+        running it again while the main loop is in the middle of it."""
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            while True:
+                chunk = self.ble.gatts_read(self.rx)
+                if not chunk:
+                    break
+                self._feed(chunk)
+        finally:
+            self._busy = False
+
+    def _feed(self, chunk):
+        i = 0
+        while i < len(chunk):
+            if self.body is None:               # reading a command line
+                j = chunk.find(b"\n", i)
+                if j < 0:
+                    self.head += chunk[i:]
+                    if len(self.head) > 300:
+                        self.head = b""
+                        self.send("ERROR command too long")
+                    return
+                line = self.head + chunk[i:j]
+                self.head = b""
+                i = j + 1
+                self._command(line.decode().strip())
+            else:                               # reading image bytes
+                n = min(len(chunk) - i, self.size - self.pos)
+                self.body[self.pos:self.pos + n] = chunk[i:i + n]
+                self.pos += n
+                i += n
+                if self.pos >= self.size:
+                    self.job = (self.img_name, self.body)
+                    self.send("DONE {}".format(self.size))
+                    self._reset()
+                    self.state = "connected"
+                elif self.pos >= self.next_ack:
+                    self.send("ACK {}".format(self.pos))
+                    self.next_ack += BT_BLOCK
+
+    def _command(self, line):
+        parts = line.split(" ", 2)
+        if parts[0] == "PING":
+            self.send("PONG")
+            return
+        if parts[0] != "IMG" or len(parts) < 3:
+            if line:
+                self.send("ERROR unknown command")
+            return
+        if self.job is not None:
+            self.send("ERROR busy reading the previous image")
+            return
+        try:
+            size = int(parts[1])
+        except ValueError:
+            self.send("ERROR bad size")
+            return
+        gc.collect()
+        free = gc.mem_free() if hasattr(gc, "mem_free") else 1 << 30
+        if size <= 0 or 2 * size + 60000 > free:   # decoding needs about as much again
+            self.send("ERROR image too big ({} bytes, {} free) - send a smaller one".format(size, free))
+            return
+        try:
+            self.body = bytearray(size)
+        except MemoryError:
+            self.send("ERROR out of memory")
+            return
+        self.size, self.pos, self.next_ack = size, 0, BT_BLOCK
+        self.img_name = parts[2]
+        self.state = "receiving"
+        print("Bluetooth: receiving {} ({} bytes)".format(self.img_name, size))
+        self.send("OK")
+
+    def send(self, msg):
+        """Send one message line to the laptop (split to fit the packet size)."""
+        if self.conn is None:
+            return
+        b = (msg + "\n").encode()
+        n = max(20, self.mtu - 3)
+        for k in range(0, len(b), n):
+            for _ in range(50):                 # the send queue can be full for a moment
+                try:
+                    self.ble.gatts_notify(self.conn, self.tx, b[k:k + n])
+                    break
+                except OSError:
+                    time.sleep_ms(10)
+
+    def take(self):
+        job, self.job = self.job, None
+        return job
+
+    def close(self):
+        try:
+            self.ble.gap_advertise(None)
+            if self.conn is not None:
+                self.ble.gap_disconnect(self.conn)
+            self.ble.active(False)
+        except Exception:
+            pass
+
+
+def bluetooth_loop(layers):
+    """Wait for images from the laptop, read each one and send back the result.
+    Stop with Ctrl+C (or Thonny's Stop button)."""
+    import json
+    try:
+        rx = BLEReceiver()
+    except ImportError:
+        print("This firmware has no Bluetooth support - set USE_BLUETOOTH = False")
+        return
+    shown = None
+    try:
+        while True:
+            if rx.conn is not None:
+                rx.poll()                       # in case a write event was skipped
+            job = rx.take()
+            if job:
+                name, data = job
+                res = _predict(layers, _MemFile(data), name)
+                del job, data
+                gc.collect()
+                rx.send("RESULT " + json.dumps(res))
+                shown = None if rx.conn is None else "result"   # keep the result on screen
+            elif rx.state == "receiving":
+                pct = rx.pos * 100 // max(1, rx.size)
+                if shown != ("rx", pct // 10):
+                    shown = ("rx", pct // 10)
+                    show(rx.img_name, "receiving", "{}%".format(pct), big=False)
+            elif rx.state != shown and not (shown == "result" and rx.state == "connected"):
+                shown = rx.state
+                if rx.state == "waiting":
+                    show("Bluetooth", "waiting for laptop", BT_NAME, big=False)
+                else:
+                    show("Bluetooth", "connected - send an image", BT_NAME, big=False)
+            time.sleep_ms(20)
+    except KeyboardInterrupt:
+        print("Stopped")
+    finally:
+        rx.close()
 
 
 # ---------------------------------------------------------------- image files
@@ -446,19 +712,26 @@ MAX_SIDE = 200      # longest side after shrinking. ocr.py loops over every pixe
 IMAGE_EXT = ("png", "bmp", "pgm", "ppm", "jpg", "jpeg")
 
 
-def load_image(path, max_side=MAX_SIDE):
-    """Image file (PNG, BMP, PGM, PPM) -> (gray bytearray, w, h)."""
-    with open(path, "rb") as f:
-        head = f.read(8)
-        f.seek(0)
-        if head[:2] == b"BM":
-            return _load_bmp(f, max_side)
-        if head[:2] in (b"P5", b"P6"):
-            return _load_pnm(f, max_side)
-        if head == b"\x89PNG\r\n\x1a\n":
-            return _load_png(f, max_side)
-        if head[:2] == b"\xff\xd8":
-            raise ValueError("JPEG can't be decoded on the ESP32 - save it as PNG on the PC first")
+def load_image(src, max_side=MAX_SIDE):
+    """Image file (PNG, BMP, PGM, PPM) -> (gray bytearray, w, h).
+    src is a file name, or an open file-like object (read + seek)."""
+    if isinstance(src, str):
+        with open(src, "rb") as f:
+            return _decode(f, max_side)
+    return _decode(src, max_side)
+
+
+def _decode(f, max_side):
+    head = f.read(8)
+    f.seek(0)
+    if head[:2] == b"BM":
+        return _load_bmp(f, max_side)
+    if head[:2] in (b"P5", b"P6"):
+        return _load_pnm(f, max_side)
+    if head == b"\x89PNG\r\n\x1a\n":
+        return _load_png(f, max_side)
+    if head[:2] == b"\xff\xd8":
+        raise ValueError("JPEG can't be decoded on the ESP32 - save it as PNG on the PC first")
     raise ValueError("unsupported image format - use PNG, BMP, PGM or PPM")
 
 

@@ -3,16 +3,18 @@
 A small optical character recognition (OCR) system that runs entirely on an
 ESP32. A neural network is trained on a PC, exported to a compact binary file,
 and run on the board in MicroPython to read characters (**0–9 and A–Z**) from
-images. The prediction is printed and shown on the board's OLED display.
+images. The images are sent from a laptop over **Bluetooth Low Energy**; the
+prediction is shown on the board's OLED display and sent back to the laptop.
 
 Developed for EPL428 (IoT) and tested on a **LilyGO T-Beam Supreme** (ESP32-S3,
 1.3" SH1106 OLED).
 
 ```
 PC:     Chars74K images ──► training.py ──► ocr.bin  (trained network)
-                                               │  upload to the board
-ESP32:  image file ──► ocr.py ──► grayscale ──► black/white ──► split into
-        characters ──► neural network ──► "HELLO42"  ──► Shell + OLED
+                                               │  upload to the board (once)
+Laptop: image file ──► send_images.py ──► Bluetooth ──┐
+ESP32:  ocr.py ──► grayscale ──► black/white ──► split into characters
+        ──► neural network ──► "HELLO42" ──► OLED + back to the laptop
 ```
 
 ## Repository contents
@@ -20,10 +22,11 @@ ESP32:  image file ──► ocr.py ──► grayscale ──► black/white �
 | File | Runs on | Purpose |
 |---|---|---|
 | `training.py` | PC | Trains the network on the Chars74K dataset and writes `ocr.bin` |
-| `ocr.py` | ESP32 (MicroPython + ulab) | Loads `ocr.bin`, reads image files, shows results on the OLED |
+| `ocr.py` | ESP32 (MicroPython + ulab) | Loads `ocr.bin`, receives images over Bluetooth, reads them, shows results on the OLED |
+| `send_images.py` | Laptop | Sends images to the board over Bluetooth and prints the results |
 | `ocr.bin` | ESP32 | The trained network (weights) |
 | `samples.png` | — | Preview of the 20×20 images the network is trained on |
-| `test_images/` | ESP32 | Example images to try on the board |
+| `test_images/` | Laptop | Example images to send to the board |
 
 ## Results
 
@@ -110,6 +113,8 @@ This produces:
 ### Requirements
 
 - An ESP32 or ESP32-S3 board. PSRAM is needed for the default model size.
+- A laptop with Bluetooth (4.0 or newer) and Python 3, with
+  `pip install bleak pillow` (`pillow` is optional; it converts JPEGs).
 - **MicroPython firmware with [ulab](https://github.com/v923z/micropython-ulab)**
   built in. The standard MicroPython firmware does not include ulab. For the
   T-Beam Supreme, use an ESP32-S3 build with PSRAM (SPIRAM) support.
@@ -121,27 +126,69 @@ This produces:
 1. Connect the board. Under **Tools → Options → Interpreter**, select
    **MicroPython (ESP32)** and the board's COM port.
 2. Check the firmware in the Shell: `import ulab` should give no error.
-3. Open **View → Files**. In the PC panel, select `ocr.py`, `ocr.bin` and some
-   images (e.g. from `test_images/`), then right-click → **Upload to /**.
-4. Open `ocr.py` and press **Run ▶**.
+3. Open **View → Files**. In the PC panel, select `ocr.py` and `ocr.bin`, then
+   right-click → **Upload to /**. (Images are not uploaded: they come over
+   Bluetooth.)
+4. Open `ocr.py` and press **Run ▶**. The board advertises over Bluetooth as
+   `ESP32-OCR` and the OLED shows "waiting for laptop".
 
-The program lists the images on the board and asks which one to read:
+### Sending images from the laptop
+
+Turn Bluetooth on (no pairing in the Windows settings is needed) and run, in
+a terminal on the laptop:
 
 ```
-OLED found on SDA=17, SCL=18
-Model loaded: 3 layers, characters: 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ
-Images on the board: char_K.bmp, esp32ok.bmp, hello42.png
-Image to read (Enter = quit): hello42.png
-hello42.png: 'HELLO42'  [200x47, 1250 ms]
+python send_images.py test_images/char_K.bmp test_images/photo_A.png
+python send_images.py test_images/      # every image in a folder
+python send_images.py                   # asks for one image at a time
 ```
 
-Press Enter on an empty line to quit.
+Example output (transfer and reading times depend on the image):
+
+```
+Looking for 'ESP32-OCR'...
+Connected to ESP32-OCR (packet size 244 bytes)
+test_images/char_K.bmp
+  sent 29974 bytes in 2.1 s (13.9 KB/s), board is reading it...
+  => 'K'  (100% sure)  [90x110, 980 ms on the board]
+```
+
+The board receives each image into RAM (nothing is written to its flash),
+reads it, shows the result on the OLED and sends it back to the laptop. Stop
+the board with Thonny's **Stop** button (or Ctrl+C).
+
+- **JPEGs and very large images** (over 150 KB) are converted to PNG and
+  shrunk to at most 400 px on the laptop before sending, if `pillow` is
+  installed. The grayscale conversion still happens on the board.
+- If the board isn't found, check that `ocr.py` is running and that no other
+  program (e.g. a phone app) is connected to it. `--address` connects to a
+  known Bluetooth address directly, and `--name` uses another board name
+  (`BT_NAME` in `ocr.py`).
+- The board uses the standard Nordic UART Service, so BLE UART apps such as
+  nRF Connect can also connect to it (e.g. send `PING` and get `PONG`).
+
+**Without Bluetooth:** set `USE_BLUETOOTH = False` in `ocr.py`, upload images
+to the board with Thonny, and the program asks which file on the board to
+read (press Enter on an empty line to quit).
+
+#### Bluetooth protocol
+
+| Direction | Message |
+|---|---|
+| laptop → board | `IMG <size> <name>
+`; the board answers `OK` or `ERROR <reason>` |
+| laptop → board | the image file's bytes, in blocks of 4096 (`BT_BLOCK`) |
+| board → laptop | `ACK <bytes so far>` after each block, `DONE <size>` after the last one |
+| board → laptop | `RESULT {"text": ..., "conf": ..., "ms": ..., "w": ..., "h": ..., "error": ...}` |
+
+The laptop waits for each `ACK` before sending the next block, so the board's
+receive buffer can never overflow.
 
 ### Images
 
 - **Formats:** PNG, BMP, PGM and PPM (colour, grayscale, palette, 16-bit and
   transparent images are all supported). **JPEG cannot be decoded on the board**:
-  save it as PNG first (e.g. in Paint).
+  `send_images.py` converts it to PNG automatically (with `pillow`).
 - The board converts each image to grayscale and shrinks it to at most 200 px
   (`MAX_SIDE` in `ocr.py`) while reading it, so large images need little memory.
   Large PNGs are slow to decode, though; BMP is fastest.
