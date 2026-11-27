@@ -124,8 +124,11 @@ class Board:
         for k in range(0, len(data), self.chunk):
             await self.client.write_gatt_char(NUS_RX, data[k:k + self.chunk], response=False)
 
-    async def send(self, name, data):
-        """Send one image, return the board's result dict."""
+    async def send(self, name, data, progress=None):
+        """Send one image, return the board's result dict.
+
+        progress(sent, total, seconds) is called after each block (used by
+        send_images_gui.py); without it, the progress is printed."""
         while not self.lines.empty():           # forget leftovers from an earlier image
             self.lines.get_nowait()
         name = name.replace("\n", " ").replace("\r", " ")
@@ -138,10 +141,14 @@ class Board:
             await self._write(block)
             sent += len(block)
             await self._expect("DONE" if sent == len(data) else "ACK")
-            print("\r  sending {}%".format(sent * 100 // len(data)), end="", flush=True)
+            if progress:
+                progress(sent, len(data), time.time() - t0)
+            else:
+                print("\r  sending {}%".format(sent * 100 // len(data)), end="", flush=True)
         secs = time.time() - t0
-        print("\r  sent {} bytes in {:.1f} s ({:.1f} KB/s), board is reading it...".format(
-            len(data), secs, len(data) / 1024 / max(secs, 1e-3)))
+        if not progress:
+            print("\r  sent {} bytes in {:.1f} s ({:.1f} KB/s), board is reading it...".format(
+                len(data), secs, len(data) / 1024 / max(secs, 1e-3)))
         _, rest = await self._expect("RESULT", timeout=120)
         return json.loads(rest)
 

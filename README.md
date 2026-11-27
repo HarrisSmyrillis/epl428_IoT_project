@@ -24,6 +24,7 @@ ESP32:  ocr.py ──► grayscale ──► black/white ──► split into ch
 | `training.py` | PC | Trains the network on the Chars74K dataset and writes `ocr.bin` |
 | `ocr.py` | ESP32 (MicroPython + ulab) | Loads `ocr.bin`, receives images over Bluetooth, reads them, shows results on the OLED |
 | `send_images.py` | Laptop | Sends images to the board over Bluetooth and prints the results |
+| `send_images_gui.py` | Laptop | The same in a window: pick images, send them, see the results (no terminal needed) |
 | `ocr.bin` | ESP32 | The trained network (weights) |
 | `samples.png` | — | Preview of the 20×20 images the network is trained on |
 | `test_images/` | Laptop | Example images to send to the board |
@@ -134,8 +135,21 @@ This produces:
 
 ### Sending images from the laptop
 
-Turn Bluetooth on (no pairing in the Windows settings is needed) and run, in
-a terminal on the laptop:
+Turn Bluetooth on (no pairing in the Windows settings is needed).
+
+**With the window (no terminal):** double-click `send_images_gui.py` (or run
+`python send_images_gui.py`).
+
+1. Press **Connect**. The board is found by its Bluetooth name (`ESP32-OCR`);
+   enter an address instead to skip the scan.
+2. The images in `test_images/` are listed already. **Add images...** and
+   **Add folder...** add more; click an image to preview it.
+3. Press **Send selected** or **Send all** (or double-click an image). The list
+   shows each image's progress, then what the board read, how sure it was and
+   how long it took; the selected image's result is shown in large letters next
+   to its preview. **Stop** stops after the current image.
+
+**From a terminal**, run on the laptop:
 
 ```
 python send_images.py test_images/char_K.bmp test_images/photo_A.png

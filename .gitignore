@@ -221,3 +221,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Chars74K dataset (download separately)
+English/
+*.tgz
